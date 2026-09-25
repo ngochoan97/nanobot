@@ -18,6 +18,7 @@ from urllib.parse import quote, urlparse
 import httpx
 
 from nanobot.agent.skills import SkillsLoader
+from nanobot.apps.cli.service import minimal_subprocess_env
 from nanobot.security.network import PinnedDNSAsyncTransport
 from nanobot.security.workspace_policy import WorkspaceBoundaryError, require_path_within
 
@@ -379,7 +380,10 @@ async def _install_skills_sh_skill(
             status=503,
         )
 
-    env = os.environ.copy()
+    # The installer is third-party code fetched at install time; build its
+    # environment from the allowlist instead of copying os.environ, so provider
+    # API keys never reach it.
+    env = minimal_subprocess_env()
     env["DISABLE_TELEMETRY"] = "1"
     command = (
         npx,
