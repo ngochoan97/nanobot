@@ -21,6 +21,7 @@ import httpx
 from loguru import logger
 
 from nanobot.agent.skills import parse_skill_metadata, valid_skill_metadata
+from nanobot.agent.tools.sandbox import wrap_command
 from nanobot.apps.protocol import app_manifest, compact_dict
 from nanobot.config.paths import get_runtime_subdir
 from nanobot.security.workspace_policy import is_path_within
@@ -45,6 +46,50 @@ _SAFE_NPM_DIR_RE = re.compile(r"^[a-z0-9._-]+$", re.IGNORECASE)
 _MENTION_RE = re.compile(r"(^|[\s([{])@([a-z0-9_-]+)\b", re.IGNORECASE)
 _SHELL_META_CHARS = ("|", "&&", "||", ";", "$(", "`", ">", "<")
 _ENDORSEMENT_WORD_RE = re.compile(r"\bofficial\s+", re.IGNORECASE)
+_ENTRY_POINT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_ENTRY_POINT_SUFFIXES = (".exe", ".bat", ".cmd", ".com", ".ps1")
+
+# Interpreters, build tools and remote-execution helpers.  A registry entry
+# naming one of these turns run_cli_app into an arbitrary-command tool: it runs
+# argv straight through subprocess, so it never passes the exec tool's deny
+# patterns, workspace checks or sandbox wrapper.
+_BLOCKED_ENTRY_POINTS = frozenset({
+    "ash", "bash", "busybox", "cmd", "command", "csh", "dash", "fish", "ksh",
+    "powershell", "pwsh", "sh", "tcsh", "zsh",
+    "cscript", "regsvr32", "rundll32", "wscript",
+    "bun", "deno", "node", "nodejs", "lua", "perl", "php", "py", "python",
+    "python2", "python3", "rscript", "ruby", "tclsh",
+    "applescript", "osascript",
+    "awk", "env", "find", "gawk", "nohup", "sed", "timeout", "watch", "xargs",
+    "doas", "scp", "sftp", "ssh", "su", "sudo", "telnet",
+    "curl", "nc", "ncat", "netcat", "socat", "wget",
+    "at", "crontab", "docker", "kubectl", "launchctl", "podman", "systemctl",
+    "brew", "cargo", "cmake", "gem", "gh", "git", "make", "npm", "npx",
+    "pip", "pip3", "pnpm", "uv", "yarn",
+})
+
+
+def _validated_entry_point(value: object) -> str:
+    """Return *value* when it is a safe CLI name, otherwise an empty string.
+
+    Registries are fetched over the network with no signature, so the entry
+    point one declares is untrusted input that ``run`` and ``test`` hand to
+    ``subprocess``.  Accept only a bare executable name -- no path separators,
+    no shell metacharacters -- and reject interpreters, which would make
+    ``run_cli_app`` equivalent to unrestricted shell access.
+    """
+    name = str(value or "").strip()
+    if not name or _ENTRY_POINT_RE.fullmatch(name) is None:
+        return ""
+    lowered = name.lower()
+    stem = lowered
+    for suffix in _ENTRY_POINT_SUFFIXES:
+        if lowered.endswith(suffix):
+            stem = lowered[: -len(suffix)]
+            break
+    if lowered in _BLOCKED_ENTRY_POINTS or stem in _BLOCKED_ENTRY_POINTS:
+        return ""
+    return name
 _ARTIFACT_EXTENSIONS = frozenset({
     ".csv",
     ".drawio",
@@ -95,6 +140,11 @@ class CliAppsRuntimeConfig:
     install_timeout: int = 300
     run_timeout: int = 60
     catalog_ttl_seconds: int = 3600
+    # Mirrors tools.exec.* so a CLI app runs under the same isolation as the
+    # shell tool. Empty means no kernel-level isolation, as for exec.
+    sandbox: str = ""
+    sandbox_ro_binds: tuple[str, ...] = ()
+    sandbox_rw_binds: tuple[str, ...] = ()
 
 
 _BRANDS: dict[str, tuple[str, str]] = {
@@ -235,6 +285,19 @@ def cli_app_skill_relative_path(workspace: Path, name: str) -> str:
 
 def _has_shell_meta(command: str) -> bool:
     return any(char in command for char in _SHELL_META_CHARS)
+
+
+def _validated_detect_command(command: str) -> bool:
+    """Return whether a bundled app's detect command names a safe executable.
+
+    ``detect_cmd`` defaults to ``entry_point``, so without this the bundled
+    strategy would mark an interpreter "already available" and record it.
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    return bool(parts) and bool(_validated_entry_point(parts[0]))
 
 
 def _command_exists(command: str) -> bool:
@@ -412,6 +475,38 @@ def _catalog_description(app: dict[str, Any]) -> str:
     """Return catalog copy without implying vendor endorsement."""
     description = str(app.get("description") or "")
     return _ENDORSEMENT_WORD_RE.sub("", description).strip()
+
+
+def minimal_subprocess_env() -> dict[str, str]:
+    """Minimal env for third-party subprocesses — no API keys or secrets.
+
+    Mirrors the shell tool's allowlist so installed apps and package
+    installers cannot read provider credentials from the parent process
+    environment.  Every code path that runs third-party code must build its
+    environment here rather than copying ``os.environ``.
+    """
+    if sys.platform == "win32":
+        sr = os.environ.get("SYSTEMROOT", r"C:\Windows")
+        env = {
+            "SYSTEMROOT": sr,
+            "COMSPEC": os.environ.get("COMSPEC", f"{sr}\\system32\\cmd.exe"),
+            "USERPROFILE": os.environ.get("USERPROFILE", ""),
+            "HOMEDRIVE": os.environ.get("HOMEDRIVE", "C:"),
+            "HOMEPATH": os.environ.get("HOMEPATH", "\\"),
+            "TEMP": os.environ.get("TEMP", f"{sr}\\Temp"),
+            "TMP": os.environ.get("TMP", f"{sr}\\Temp"),
+            "PATHEXT": os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
+            "PATH": os.environ.get("PATH", f"{sr}\\system32;{sr}"),
+            "PYTHONUNBUFFERED": "1",
+        }
+        return env
+    return {
+        "HOME": os.environ.get("HOME", "/tmp"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "TERM": os.environ.get("TERM", "dumb"),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PYTHONUNBUFFERED": "1",
+    }
 
 
 class CliAppManager:
@@ -600,14 +695,27 @@ class CliAppManager:
                 return False
         return True
 
+    @staticmethod
+    def _source_names(app: dict[str, Any]) -> list[str]:
+        """Split the merged "_source" marker into its contributing registries.
+
+        Entries that share a name across registries are merged, and the last
+        registry wins every field. The marker records each contributor, so the
+        trust label must be derived from all of them rather than matched
+        against a single name.
+        """
+        return [part for part in str(app.get("_source") or "").split("+") if part]
+
     def _manifest_source(self, app: dict[str, Any]) -> str:
-        source = str(app.get("_source") or "harness")
-        if source == "extensions":
+        sources = self._source_names(app) or ["harness"]
+        if "extensions" in sources:
             return "nanobot-extension"
-        return f"cli-anything:{source}"
+        return f"cli-anything:{'+'.join(sources)}"
 
     def _trust_registry(self, app: dict[str, Any]) -> str:
-        return "nanobot-extension" if str(app.get("_source") or "") == "extensions" else "cli-anything"
+        # Report the least-trusted contributor: a merged entry carries the
+        # install command and skill content of whichever registry wrote last.
+        return "nanobot-extension" if "extensions" in self._source_names(app) else "cli-anything"
 
     def get_app(self, name: str, *, force_refresh: bool = False) -> dict[str, Any]:
         wanted = name.lower()
@@ -673,7 +781,7 @@ class CliAppManager:
         installed: dict[str, Any],
     ) -> dict[str, Any]:
         name = str(app["name"])
-        entry_point = str(app.get("entry_point") or "")
+        entry_point = _validated_entry_point(app.get("entry_point"))
         install_supported = self._install_supported(app)
         is_installed = name in installed
         available = bool(entry_point and shutil.which(entry_point))
@@ -991,33 +1099,36 @@ class CliAppManager:
         raise CliAppError("this CLI app uses an unsupported install strategy")
 
     def _subprocess_env(self) -> dict[str, str]:
-        """Minimal env for CLI app subprocesses — no API keys or secrets.
+        """Minimal env for CLI app subprocesses — no API keys or secrets."""
+        return minimal_subprocess_env()
 
-        Mirrors the shell tool's allowlist so installed apps cannot read
-        provider credentials from the parent process environment.
+    def _sandboxed_argv(self, argv: list[str], cwd: Path) -> tuple[list[str], Path]:
+        """Wrap *argv* in the configured exec sandbox, mirroring the shell tool.
+
+        CLI apps are third-party binaries chosen from a network registry, so
+        they belong inside the same isolation as ``exec``. The sandbox backends
+        wrap a shell command string, so the argv is quoted back into one.
+        Windows has no backend; warn and run unsandboxed, as the shell tool does.
         """
+        sandbox = self.runtime.sandbox
+        if not sandbox:
+            return argv, cwd
         if sys.platform == "win32":
-            sr = os.environ.get("SYSTEMROOT", r"C:\Windows")
-            env = {
-                "SYSTEMROOT": sr,
-                "COMSPEC": os.environ.get("COMSPEC", f"{sr}\\system32\\cmd.exe"),
-                "USERPROFILE": os.environ.get("USERPROFILE", ""),
-                "HOMEDRIVE": os.environ.get("HOMEDRIVE", "C:"),
-                "HOMEPATH": os.environ.get("HOMEPATH", "\\"),
-                "TEMP": os.environ.get("TEMP", f"{sr}\\Temp"),
-                "TMP": os.environ.get("TMP", f"{sr}\\Temp"),
-                "PATHEXT": os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD"),
-                "PATH": os.environ.get("PATH", f"{sr}\\system32;{sr}"),
-                "PYTHONUNBUFFERED": "1",
-            }
-            return env
-        return {
-            "HOME": os.environ.get("HOME", "/tmp"),
-            "LANG": os.environ.get("LANG", "C.UTF-8"),
-            "TERM": os.environ.get("TERM", "dumb"),
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "PYTHONUNBUFFERED": "1",
-        }
+            logger.warning(
+                "Sandbox '{}' is not supported on Windows; running CLI app unsandboxed",
+                sandbox,
+            )
+            return argv, cwd
+        workspace = str(self.workspace.expanduser().resolve())
+        command = wrap_command(
+            sandbox,
+            shlex.join(argv),
+            workspace,
+            str(cwd),
+            sandbox_ro_binds=list(self.runtime.sandbox_ro_binds),
+            sandbox_rw_binds=list(self.runtime.sandbox_rw_binds),
+        )
+        return [os.environ.get("SHELL") or "/bin/sh", "-c", command], Path(workspace)
 
     def _run_argv(self, argv: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
         command = subprocess.list2cmdline(argv)
@@ -1178,7 +1289,7 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         if not self._install_supported(app):
             raise CliAppError("this CLI app uses an unsupported install strategy")
         strategy = self._strategy(app)
-        entry_point = str(app.get("entry_point") or "")
+        entry_point = _validated_entry_point(app.get("entry_point"))
         if entry_point and shutil.which(entry_point):
             self._record_installed(app)
             return self.payload() | {
@@ -1191,7 +1302,7 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
             }
         if strategy == "bundled":
             detect_cmd = str(app.get("detect_cmd") or app.get("entry_point") or "")
-            if detect_cmd and _command_exists(detect_cmd):
+            if detect_cmd and _validated_detect_command(detect_cmd) and _command_exists(detect_cmd):
                 self._record_installed(app)
                 return self.payload() | {
                     "last_action": {
@@ -1319,10 +1430,13 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
 
     def test(self, name: str) -> dict[str, Any]:
         app = self.get_app(name)
-        entry = str(app.get("entry_point") or "")
-        resolved = shutil.which(entry)
+        declared = str(app.get("entry_point") or "")
+        entry = _validated_entry_point(declared)
+        if declared and not entry:
+            raise CliAppError(f"CLI app '{name}' declares an unsafe entry point")
+        resolved = shutil.which(entry) if entry else None
         if not entry or not resolved:
-            raise CliAppError(f"{entry or name} is not available on PATH")
+            raise CliAppError(f"{declared or name} is not available on PATH")
         result = self._run_argv([resolved, "--help"], timeout=min(self.runtime.run_timeout, 30))
         ok = result.returncode == 0
         output = _truncate((result.stdout or result.stderr or "").strip(), 3000)
@@ -1443,19 +1557,23 @@ Use the `run_cli_app` tool with `name="{name}"` for command execution. Do not in
         if str(app["name"]) not in installed:
             raise CliAppError(f"CLI app '{name}' is not installed")
         cwd = self._resolve_cwd(working_dir, restrict_to_workspace=restrict_to_workspace)
-        entry = str(installed[str(app["name"])].get("entry_point") or app.get("entry_point") or "")
-        resolved = shutil.which(entry)
+        declared = str(installed[str(app["name"])].get("entry_point") or app.get("entry_point") or "")
+        entry = _validated_entry_point(declared)
+        if declared and not entry:
+            raise CliAppError(f"CLI app '{name}' declares an unsafe entry point")
+        resolved = shutil.which(entry) if entry else None
         if not entry or not resolved:
-            raise CliAppError(f"{entry or name} is not available on PATH")
+            raise CliAppError(f"{declared or name} is not available on PATH")
         clean_args = [str(arg) for arg in (args or [])]
         if json_output and "--json" not in clean_args:
             clean_args = ["--json", *clean_args]
         effective_timeout = max(1, min(timeout or self.runtime.run_timeout, 600))
         artifact_snapshot = self._artifact_snapshot(cwd)
+        argv, run_cwd = self._sandboxed_argv([resolved, *clean_args], cwd)
         try:
             result = subprocess.run(
-                [resolved, *clean_args],
-                cwd=str(cwd),
+                argv,
+                cwd=str(run_cwd),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

@@ -80,6 +80,10 @@ class CliAppsTool(Tool):
                 install_timeout=cfg.install_timeout,
                 run_timeout=cfg.run_timeout,
                 catalog_ttl_seconds=cfg.catalog_ttl_seconds,
+                # A CLI app is a third-party binary; isolate it exactly as exec does.
+                sandbox=ctx.config.exec.sandbox,
+                sandbox_ro_binds=tuple(ctx.config.exec.sandbox_ro_binds),
+                sandbox_rw_binds=tuple(ctx.config.exec.sandbox_rw_binds),
             ),
         )
 
