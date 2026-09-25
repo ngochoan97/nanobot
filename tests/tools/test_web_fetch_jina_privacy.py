@@ -174,6 +174,9 @@ async def test_execute_fetches_credential_urls_locally(monkeypatch) -> None:
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
+        async def aiter_bytes(self):
+            yield b"<html><head><title>T</title></head><body><p>ok</p></body></html>"
+
     class FakeResponse:
         status_code = 200
         url = "https://example.com/download"
@@ -237,6 +240,9 @@ async def test_execute_does_not_send_redirected_credential_url_to_jina(monkeypat
 
         async def __aexit__(self, exc_type, exc, tb):
             return False
+
+        async def aiter_bytes(self):
+            yield b"<html><head><title>T</title></head><body><p>ok</p></body></html>"
 
     class FakeResponse:
         status_code = 200

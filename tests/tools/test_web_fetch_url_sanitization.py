@@ -26,11 +26,14 @@ class FakeResponse:
 
 
 class FakeStreamResponse:
+    status_code = 200
     headers = {"content-type": "text/html"}
     url = "https://example.com/page"
     async def __aenter__(self): return self
     async def __aexit__(self, *a): return False
 
+    async def aiter_bytes(self):
+        yield b"<html><head><title>T</title></head><body><p>ok</p></body></html>"
 
 class FakeClient:
     def __init__(self, *a, **kw): pass
