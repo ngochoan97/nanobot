@@ -599,15 +599,21 @@ def _fsync_directory_after_replace(directory: Path) -> None:
             os.close(fd)
 
 
-def _write_text_atomic(path: Path, content: str) -> None:
+def _write_text_atomic(path: Path, content: str, *, mode: int | None = None) -> None:
+    """Write *content* to *path* atomically.
+
+    An existing file keeps its permissions. *mode* applies only when the file
+    is new, so a file holding secrets is never created at the process umask.
+    """
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     existing_mode: int | None = None
     with suppress(OSError):
         existing_mode = stat.S_IMODE(path.stat().st_mode)
+    effective_mode = existing_mode if existing_mode is not None else mode
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            if existing_mode is not None:
-                os.chmod(tmp, existing_mode)
+            if effective_mode is not None:
+                os.chmod(tmp, effective_mode)
             f.write(content)
             f.flush()
             os.fsync(f.fileno())

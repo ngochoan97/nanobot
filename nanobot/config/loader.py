@@ -3,6 +3,7 @@
 import json
 import os
 import re
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, cast, overload
 
@@ -152,7 +153,11 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         config_path: Optional path to save to. Uses default if not provided.
     """
     path = config_path or get_config_path()
+    # config.json can hold plaintext provider keys and channel tokens, so the
+    # data directory and the file itself must not be created at the umask.
     path.parent.mkdir(parents=True, exist_ok=True)
+    with suppress(OSError, NotImplementedError):
+        os.chmod(path.parent, 0o700)
 
     data = config.model_dump(mode="json", by_alias=True)
     # OAuth credentials live in dedicated token stores. Persist only the
@@ -171,7 +176,7 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
             data.setdefault("providers", {})[alias] = settings
 
     # Temp + replace so a crash mid-write cannot leave a truncated config.json.
-    _write_text_atomic(path, json.dumps(data, indent=2, ensure_ascii=False))
+    _write_text_atomic(path, json.dumps(data, indent=2, ensure_ascii=False), mode=0o600)
 
 
 def merge_missing_defaults(existing: object, defaults: object) -> object:
